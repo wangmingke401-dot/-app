@@ -1,5 +1,6 @@
 import { app, ipcMain } from 'electron'
 import { join } from 'path'
+import { existsSync } from 'fs'
 import Database from 'better-sqlite3'
 
 // 预设分类体系（一级大类 + 二级小类），与 CLAUDE.md 产品文档一致
@@ -20,7 +21,10 @@ let db
 
 /** 打开（或创建）本地数据库文件，建表、预置分类、注册界面调用接口。应用启动时调用一次。 */
 export function initDatabase() {
-  db = new Database(join(app.getPath('userData'), 'heima-accounting.db'))
+  const dbPath = join(app.getPath('userData'), 'heima-accounting.db')
+  // 仅数据库文件首次创建时预置分类；用户删光全部分类后重启，不能复活内置分类
+  const isNew = !existsSync(dbPath)
+  db = new Database(dbPath)
   db.pragma('journal_mode = WAL')
 
   db.exec(`
@@ -43,7 +47,7 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
   `)
 
-  seedCategories()
+  if (isNew) seedCategories()
   registerIpcHandlers()
 }
 
@@ -100,6 +104,115 @@ function listCategories() {
       icon: p.icon,
       children: rows.filter((c) => c.parent_id === p.id).map((c) => ({ id: c.id, name: c.name }))
     }))
+}
+
+// ---------- 自定义分类：校验与增删改 ----------
+
+const MAX_CATEGORY_NAME_LEN = 10
+const DEFAULT_CATEGORY_ICON = '📦'
+
+/** 判断字符串是否为「一个 emoji」（兼容 👨‍👩‍👧 等组合表情与 1️⃣ 键帽） */
+function isSingleEmoji(s) {
+  const segs = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s)]
+  if (segs.length !== 1) return false
+  return /\p{Extended_Pictographic}/u.test(s) || /^[0-9#*]️⃣$/u.test(s)
+}
+
+/** 校验新增分类的数据；不合法时抛出中文错误信息 */
+function validateCategory(data) {
+  const name = String(data.name ?? '').trim()
+  if (!name) throw new Error('请输入分类名称')
+  if ([...name].length > MAX_CATEGORY_NAME_LEN) throw new Error('分类名称最多 10 个字')
+
+  const parentId = data.parent_id == null ? null : Number(data.parent_id)
+  if (parentId !== null && (!Number.isInteger(parentId) || parentId <= 0)) {
+    throw new Error('所属大类不正确')
+  }
+
+  let icon = ''
+  if (parentId === null) {
+    icon = String(data.icon ?? '').trim() || DEFAULT_CATEGORY_ICON
+    if (!isSingleEmoji(icon)) throw new Error('图标必须是一个 emoji 表情')
+    const dup = db.prepare('SELECT id FROM categories WHERE parent_id IS NULL AND name = ?').get(name)
+    if (dup) throw new Error('已存在同名分类')
+  } else {
+    const parent = db
+      .prepare('SELECT id FROM categories WHERE id = ? AND parent_id IS NULL')
+      .get(parentId)
+    if (!parent) throw new Error('所属大类不存在，可能已被删除')
+    const dup = db
+      .prepare('SELECT id FROM categories WHERE parent_id = ? AND name = ?')
+      .get(parentId, name)
+    if (dup) throw new Error('该大类下已存在同名分类')
+  }
+  return { name, parent_id: parentId, icon }
+}
+
+function createCategory(data) {
+  const v = validateCategory(data)
+  const info = db
+    .prepare('INSERT INTO categories (parent_id, name, icon) VALUES (?, ?, ?)')
+    .run(v.parent_id, v.name, v.icon)
+  return { id: Number(info.lastInsertRowid) }
+}
+
+function updateCategory(id, data) {
+  const existing = db
+    .prepare('SELECT id, parent_id, name, icon FROM categories WHERE id = ?')
+    .get(id)
+  if (!existing) throw new Error('该分类不存在，可能已被删除')
+
+  const name = String(data.name ?? '').trim()
+  if (!name) throw new Error('请输入分类名称')
+  if ([...name].length > MAX_CATEGORY_NAME_LEN) throw new Error('分类名称最多 10 个字')
+  // 同层查重，排除自身；不支持把小类挪到别的大类（忽略传入的 parent_id）
+  const dup =
+    existing.parent_id === null
+      ? db
+          .prepare('SELECT id FROM categories WHERE parent_id IS NULL AND name = ? AND id != ?')
+          .get(name, id)
+      : db
+          .prepare('SELECT id FROM categories WHERE parent_id = ? AND name = ? AND id != ?')
+          .get(existing.parent_id, name, id)
+  if (dup) throw new Error(existing.parent_id === null ? '已存在同名分类' : '该大类下已存在同名分类')
+
+  let icon = existing.icon
+  if (existing.parent_id === null) {
+    icon = String(data.icon ?? '').trim() || DEFAULT_CATEGORY_ICON
+    if (!isSingleEmoji(icon)) throw new Error('图标必须是一个 emoji 表情')
+  }
+  db.prepare('UPDATE categories SET name = ?, icon = ? WHERE id = ?').run(name, icon, id)
+  return { id }
+}
+
+function deleteCategory(id) {
+  const existing = db.prepare('SELECT id, parent_id FROM categories WHERE id = ?').get(id)
+  if (!existing) throw new Error('该分类不存在，可能已被删除')
+
+  let n
+  if (existing.parent_id === null) {
+    // 一级大类：统计其下所有小类关联的账目总数
+    n = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM expenses e
+         JOIN categories c ON c.id = e.category_id
+         WHERE c.parent_id = ?`
+      )
+      .get(id).n
+    if (n > 0) throw new Error(`该大类下还有 ${n} 笔账目，不能删除`)
+  } else {
+    n = db.prepare('SELECT COUNT(*) AS n FROM expenses WHERE category_id = ?').get(id).n
+    if (n > 0) throw new Error(`该分类下还有 ${n} 笔账目，不能删除`)
+  }
+
+  const remove = db.transaction(() => {
+    if (existing.parent_id === null) {
+      db.prepare('DELETE FROM categories WHERE parent_id = ?').run(id) // 先删其下小类
+    }
+    db.prepare('DELETE FROM categories WHERE id = ?').run(id)
+  })
+  remove()
+  return { id }
 }
 
 function listExpenses(year, month) {
@@ -192,6 +305,9 @@ function trendStats(months) {
 
 function registerIpcHandlers() {
   ipcMain.handle('categories:list', () => listCategories())
+  ipcMain.handle('categories:create', (_e, data) => createCategory(data))
+  ipcMain.handle('categories:update', (_e, { id, ...data }) => updateCategory(id, data))
+  ipcMain.handle('categories:delete', (_e, id) => deleteCategory(id))
   ipcMain.handle('expenses:list', (_e, { year, month }) => listExpenses(year, month))
   ipcMain.handle('expenses:create', (_e, data) => createExpense(data))
   ipcMain.handle('expenses:update', (_e, { id, ...data }) => updateExpense(id, data))

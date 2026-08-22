@@ -1,6 +1,7 @@
 <script setup>
 import { ref } from 'vue'
 import BillsView from './views/BillsView.vue'
+import CategoriesView from './views/CategoriesView.vue'
 import StatsView from './views/StatsView.vue'
 
 const view = ref('bills')
@@ -20,6 +21,9 @@ const view = ref('bills')
         <button class="nav-btn" :class="{ active: view === 'bills' }" @click="view = 'bills'">
           📒 账单
         </button>
+        <button class="nav-btn" :class="{ active: view === 'categories' }" @click="view = 'categories'">
+          🗂️ 分类
+        </button>
         <button class="nav-btn" :class="{ active: view === 'stats' }" @click="view = 'stats'">
           📊 统计
         </button>
@@ -28,6 +32,7 @@ const view = ref('bills')
     </aside>
     <main class="main">
       <BillsView v-if="view === 'bills'" />
+      <CategoriesView v-else-if="view === 'categories'" />
       <StatsView v-else />
     </main>
   </div>
