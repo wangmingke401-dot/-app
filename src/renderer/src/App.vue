@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import BillsView from './views/BillsView.vue'
 import CategoriesView from './views/CategoriesView.vue'
 import StatsView from './views/StatsView.vue'
+import SnakeView from './views/SnakeView.vue'
 
 const view = ref('bills')
 </script>
@@ -27,13 +28,17 @@ const view = ref('bills')
         <button class="nav-btn" :class="{ active: view === 'stats' }" @click="view = 'stats'">
           📊 统计
         </button>
+        <button class="nav-btn" :class="{ active: view === 'game' }" @click="view = 'game'">
+          🎮 游戏
+        </button>
       </nav>
       <div class="sidebar-foot">所有数据只保存在<br />你自己电脑上，不联网</div>
     </aside>
     <main class="main">
       <BillsView v-if="view === 'bills'" />
       <CategoriesView v-else-if="view === 'categories'" />
-      <StatsView v-else />
+      <StatsView v-else-if="view === 'stats'" />
+      <SnakeView v-else />
     </main>
   </div>
 </template>
